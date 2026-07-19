@@ -92,7 +92,7 @@ def log_exception(operation, exception):
 # No hardcoded BEARER_TOKEN or COOKIES; always use fresh from Playwright script
 
 
-# Directory containing all entry HTMLs (use backend/website)
+# Directory containing all entry HTMLs (use backend/website by default)
 target_dir = os.path.join(os.path.dirname(__file__), "backend", "website")
 
 
@@ -113,6 +113,23 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
+
+def apply_run_paths(paths):
+    """Point phone fetcher at a named run (or legacy shared dirs)."""
+    global target_dir, phone_db_dir, db_path, log_path
+    target_dir = paths["website"]
+    phone_db_dir = paths["phone_db_dir"]
+    db_path = paths["phone_db"]
+    log_path = os.path.join(phone_db_dir, "phones.log")
+    os.makedirs(phone_db_dir, exist_ok=True)
+    # Reconfigure file logging for this run
+    root = logging.getLogger()
+    for handler in list(root.handlers):
+        if isinstance(handler, logging.FileHandler):
+            root.removeHandler(handler)
+            handler.close()
+    root.addHandler(logging.FileHandler(log_path, encoding='utf-8'))
+
 def init_db():
     conn = sqlite3.connect(db_path)
     c = conn.cursor()
@@ -262,6 +279,23 @@ async def process_file(session, html_path, bearer_token, cookies):
 async def main():
     # Setup comprehensive logging
     setup_comprehensive_logging()
+
+    import argparse
+    from run_paths import resolve_paths, write_run_meta
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--run",
+        type=str,
+        help="Read HTML / write phones under backend/runs/<name>/",
+    )
+    args = parser.parse_args()
+    paths = resolve_paths(args.run)
+    apply_run_paths(paths)
+    init_db()
+    if args.run:
+        write_run_meta(paths)
+        logging.info(f"Run '{paths['run_name']}' -> {paths['root']}")
     
     # Log process start
     start_time = time.time()
@@ -338,5 +372,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    init_db()
     asyncio.run(main())

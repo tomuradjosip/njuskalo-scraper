@@ -127,6 +127,28 @@ DB_PATH = "backend/phoneDB/phones.db"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
 
+
+def apply_run_paths(paths):
+    """Point parser outputs at a named run (or legacy shared dirs)."""
+    global INPUT_DIR, OUTPUT_DIR, LOG_DIR, DB_PATH
+    INPUT_DIR = paths["website"]
+    OUTPUT_DIR = paths["json"]
+    LOG_DIR = paths["logs"]
+    DB_PATH = paths["phone_db"]
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(LOG_DIR, exist_ok=True)
+
+
+def _init_worker(input_dir, output_dir, db_path):
+    """Ensure ProcessPool workers use the same run paths + phone cache."""
+    global INPUT_DIR, OUTPUT_DIR, DB_PATH, _db_cache
+    INPUT_DIR = input_dir
+    OUTPUT_DIR = output_dir
+    DB_PATH = db_path
+    # load_phone_cache is defined below; resolve at call time in worker processes
+    load_phone_cache()
+
+
 # Exit codes
 EXIT_SUCCESS = 0
 EXIT_CONFIG_ERROR = 1
@@ -338,7 +360,11 @@ def process_batch_ultrafast(filenames):
     results = []
     
     # Use ProcessPoolExecutor for better performance than Pool
-    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    with ProcessPoolExecutor(
+        max_workers=MAX_WORKERS,
+        initializer=_init_worker,
+        initargs=(INPUT_DIR, OUTPUT_DIR, DB_PATH),
+    ) as executor:
         # Submit all tasks
         future_to_filename = {executor.submit(process_single_file_ultrafast, filename): filename 
                              for filename in filenames}
@@ -384,6 +410,22 @@ def main():
     """Ultra-fast main function"""
     # Setup comprehensive logging
     setup_comprehensive_logging()
+
+    import argparse
+    from run_paths import resolve_paths, write_run_meta
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--run",
+        type=str,
+        help="Read HTML / write JSON under backend/runs/<name>/",
+    )
+    args = parser.parse_args()
+    paths = resolve_paths(args.run)
+    apply_run_paths(paths)
+    if args.run:
+        write_run_meta(paths)
+        print(f"[INFO] Run '{paths['run_name']}' -> {paths['root']}")
     
     # Log process start
     process_start_time = time.time()

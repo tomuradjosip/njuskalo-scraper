@@ -12,6 +12,7 @@ import logging
 import sys
 import time
 from datetime import datetime
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import sqlite3
 import json
 
@@ -139,6 +140,8 @@ LOCAL_SCRAPING_DURATION = 10 * 60  # 10 minutes
 PROXY_SCRAPING_DURATION = 5 * 60   # 5 minutes
 cycle_start_time = time.time()
 is_using_local = True  # Start with local
+LOCAL_ONLY = False
+SKIP_EXISTING_HTML = False
 
 def get_next_proxy():
     """Get the next proxy in rotation"""
@@ -154,6 +157,9 @@ def get_next_proxy():
 def should_use_local_connection():
     """Determine if we should use local connection based on cycling schedule"""
     global cycle_start_time, is_using_local
+
+    if LOCAL_ONLY:
+        return True
     
     current_time = time.time()
     elapsed_time = current_time - cycle_start_time
@@ -238,18 +244,69 @@ ENTRY_LINK_A_CLASS = "link"
 
 BACKEND_WEBSITE_DIR = os.path.join(os.path.dirname(__file__), "backend", "website")
 BACKEND_LOGS_DIR = os.path.join(os.path.dirname(__file__), "backend", "logs")
+PHONE_DB_DIR = os.path.join(os.path.dirname(__file__), "backend", "phoneDB")
 LEAF_URLS_DIR = os.path.join(os.path.dirname(__file__), "backend", "categories", "leaf_urls")
 CATEGORIES_LOGS_DIR = os.path.join(os.path.dirname(__file__), "backend", "categories", "logs")
 CATEGORIES_HTMLS_DIR = os.path.join(os.path.dirname(__file__), "backend", "categories", "htmls")
 CATEGORIES_TREE_DIR = os.path.join(os.path.dirname(__file__), "backend", "categories", "tree_jsons")
 os.makedirs(BACKEND_WEBSITE_DIR, exist_ok=True)
 os.makedirs(BACKEND_LOGS_DIR, exist_ok=True)
+os.makedirs(PHONE_DB_DIR, exist_ok=True)
 os.makedirs(LEAF_URLS_DIR, exist_ok=True)
 os.makedirs(CATEGORIES_LOGS_DIR, exist_ok=True)
 os.makedirs(CATEGORIES_HTMLS_DIR, exist_ok=True)
 os.makedirs(CATEGORIES_TREE_DIR, exist_ok=True)
 CONCURRENT_LEAFS = 1
 CONCURRENT_ENTRIES = 6
+ENTRY_DELAY = 0.0          # seconds after each ad fetch
+PAGE_DELAY_MIN = 0.5       # search result page delay range
+PAGE_DELAY_MAX = 1.0
+
+
+def apply_run_paths(paths):
+    """Point scraper outputs at a named run (or legacy shared dirs)."""
+    global BACKEND_WEBSITE_DIR, BACKEND_LOGS_DIR, PHONE_DB_DIR, LEAF_URLS_DIR, CHECKPOINTS_DIR
+    BACKEND_WEBSITE_DIR = paths["website"]
+    BACKEND_LOGS_DIR = paths["logs"]
+    PHONE_DB_DIR = paths["phone_db_dir"]
+    LEAF_URLS_DIR = paths["leaf_urls"]
+    CHECKPOINTS_DIR = paths["checkpoints"]
+    os.makedirs(BACKEND_WEBSITE_DIR, exist_ok=True)
+    os.makedirs(BACKEND_LOGS_DIR, exist_ok=True)
+    os.makedirs(PHONE_DB_DIR, exist_ok=True)
+    os.makedirs(LEAF_URLS_DIR, exist_ok=True)
+    os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
+
+
+def apply_rate_limits(concurrency=None, delay=None, page_delay=None, polite=False):
+    """Configure request pacing for larger scrapes."""
+    global CONCURRENT_ENTRIES, ENTRY_DELAY, PAGE_DELAY_MIN, PAGE_DELAY_MAX
+    if polite:
+        concurrency = 1 if concurrency is None else concurrency
+        delay = 2.0 if delay is None else delay
+        page_delay = 1.5 if page_delay is None else page_delay
+    if concurrency is not None:
+        CONCURRENT_ENTRIES = max(1, int(concurrency))
+    if delay is not None:
+        ENTRY_DELAY = max(0.0, float(delay))
+    if page_delay is not None:
+        PAGE_DELAY_MIN = max(0.0, float(page_delay))
+        PAGE_DELAY_MAX = max(PAGE_DELAY_MIN, float(page_delay) * 1.4)
+    print(
+        f"[RATE LIMIT] concurrency={CONCURRENT_ENTRIES}, "
+        f"entry_delay={ENTRY_DELAY:.2f}s, "
+        f"page_delay={PAGE_DELAY_MIN:.2f}-{PAGE_DELAY_MAX:.2f}s"
+    )
+
+
+def apply_connection_options(local_only=False, skip_existing=False):
+    global LOCAL_ONLY, SKIP_EXISTING_HTML
+    LOCAL_ONLY = bool(local_only)
+    SKIP_EXISTING_HTML = bool(skip_existing)
+    if LOCAL_ONLY:
+        print("[INFO] Local-only mode: proxies disabled")
+    if SKIP_EXISTING_HTML:
+        print("[INFO] Skipping ads that already have HTML on disk")
 
 import logging
 
@@ -419,7 +476,16 @@ async def save_entry_html(session, entry_url):
     if not ad_id:
         print(f"[SKIP] Could not extract ad_id from {entry_url}")
         return False
-    db_dir = os.path.join(os.path.dirname(__file__), "backend", "phoneDB")
+
+    filename = f"{ad_id}.html"
+    save_path = os.path.join(BACKEND_WEBSITE_DIR, filename)
+    log_path = os.path.join(BACKEND_LOGS_DIR, f"{ad_id}.log")
+
+    if SKIP_EXISTING_HTML and os.path.exists(save_path) and os.path.getsize(save_path) > 0:
+        print(f"[SKIP] HTML already exists for ad {ad_id}")
+        return True
+
+    db_dir = PHONE_DB_DIR
     os.makedirs(db_dir, exist_ok=True)
     db_path = os.path.join(db_dir, "phones.db")
     # Create the DB file and table if not present
@@ -441,11 +507,6 @@ async def save_entry_html(session, entry_url):
         conn.close()
         return False
     conn.close()
-    
-    # Use only ad_id for filename (no datetime)
-    filename = f"{ad_id}.html"
-    save_path = os.path.join(BACKEND_WEBSITE_DIR, filename)
-    log_path = os.path.join(BACKEND_LOGS_DIR, f"{ad_id}.log")
     
     t0 = time.time()
     html = await fetch_html(session, entry_url)
@@ -477,7 +538,7 @@ async def save_entry_html(session, entry_url):
 def get_unified_checkpoint_file(leaf_file):
     today_str = datetime.now().strftime("%Y-%m-%d")
     base = os.path.basename(leaf_file)
-    return os.path.join(CHECKPOINTS_DIR, f"scrape_checkpoint_{today_str}_{base}.json")
+    return os.path.join(CHECKPOINTS_DIR, f"scrape_pages_{today_str}_{base}.json")
 
 def save_unified_checkpoint(leaf_file, leaf_url, page):
     path = get_unified_checkpoint_file(leaf_file)
@@ -492,7 +553,7 @@ def save_unified_checkpoint(leaf_file, leaf_url, page):
     if leaf_url not in data:
         data[leaf_url] = {}
     data[leaf_url]["last_page"] = page
-    data[leaf_url]["last_url_fetched"] = leaf_url if page == 1 else f"{leaf_url}?page={page}"
+    data[leaf_url]["last_url_fetched"] = build_page_url(leaf_url, page)
     data[leaf_url]["timestamp"] = datetime.now().isoformat()
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f)
@@ -512,6 +573,48 @@ def load_unified_checkpoint(leaf_file, leaf_url):
     return 1
 
 
+def clear_page_checkpoints(leaf_file=None):
+    """Reset search-page progress so the next run rewalks from page 1."""
+    removed = 0
+    if leaf_file:
+        path = get_unified_checkpoint_file(leaf_file)
+        if os.path.exists(path):
+            os.remove(path)
+            removed += 1
+            print(f"[INFO] Cleared page checkpoint: {path}")
+        return removed
+    for name in os.listdir(CHECKPOINTS_DIR):
+        if name.startswith(f"scrape_pages_{today_str}_") and name.endswith(".json"):
+            path = os.path.join(CHECKPOINTS_DIR, name)
+            try:
+                os.remove(path)
+                removed += 1
+                print(f"[INFO] Cleared page checkpoint: {path}")
+            except Exception as e:
+                print(f"[WARN] Could not delete {path}: {e}")
+    return removed
+
+
+def build_page_url(leaf_url, page):
+    """Build paginated URL while preserving existing filter query params."""
+    if page <= 1:
+        return leaf_url
+    parsed = urlparse(leaf_url)
+    qs = parse_qs(parsed.query, keep_blank_values=True)
+    qs["page"] = [str(page)]
+    return urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
+
+
+def write_custom_url_file(url):
+    """Write a single filtered URL into today's leaf_urls file and return its path."""
+    os.makedirs(LEAF_URLS_DIR, exist_ok=True)
+    leaf_file = os.path.join(LEAF_URLS_DIR, f"custom_leaf_urls_{today_str}.txt")
+    with open(leaf_file, "w", encoding="utf-8") as f:
+        f.write(url.strip() + "\n")
+    print(f"[INFO] Custom URL written to {leaf_file}")
+    return leaf_file
+
+
 async def process_leaf_url(session, leaf_url, leaf_file, progress_callback=None):
     entry_urls = []
     page = load_unified_checkpoint(leaf_file, leaf_url)
@@ -520,7 +623,7 @@ async def process_leaf_url(session, leaf_url, leaf_file, progress_callback=None)
     prev_page_urls = None
     import re
     while True:
-        url = leaf_url if page == 1 else f"{leaf_url}?page={page}"
+        url = build_page_url(leaf_url, page)
         html = await fetch_html(session, url)
         save_unified_checkpoint(leaf_file, leaf_url, page)
         if not html:
@@ -557,20 +660,43 @@ async def process_leaf_url(session, leaf_url, leaf_file, progress_callback=None)
         if len(page_entry_urls) < 25:
             break
         page += 1
-        await asyncio.sleep(random.uniform(0.5, 1.0))
+        await asyncio.sleep(random.uniform(PAGE_DELAY_MIN, PAGE_DELAY_MAX))
     entry_urls = list(set(entry_urls))
     saved = 0
     total = len(entry_urls)
     t0 = time.time()
     req_count = 0
     sem = asyncio.Semaphore(CONCURRENT_ENTRIES)
+    rate_lock = asyncio.Lock()
+    next_allowed_at = 0.0
     processed_ads = set()
+
+    async def wait_for_rate_limit():
+        nonlocal next_allowed_at
+        if ENTRY_DELAY <= 0:
+            return
+        async with rate_lock:
+            now = time.monotonic()
+            wait_for = next_allowed_at - now
+            if wait_for > 0:
+                await asyncio.sleep(wait_for)
+            jitter = random.uniform(0.85, 1.15)
+            next_allowed_at = time.monotonic() + (ENTRY_DELAY * jitter)
+
     async def save_one(entry_url):
         async with sem:
             ad_id = extract_ad_id_from_url(entry_url)
             if ad_id in processed_ads:
                 print(f"[SKIP] Already processed ad {ad_id} in this run")
                 return False
+            # Skip existing files before rate-limit wait so resumes stay fast
+            if SKIP_EXISTING_HTML and ad_id:
+                save_path = os.path.join(BACKEND_WEBSITE_DIR, f"{ad_id}.html")
+                if os.path.exists(save_path) and os.path.getsize(save_path) > 0:
+                    print(f"[SKIP] HTML already exists for ad {ad_id}")
+                    processed_ads.add(ad_id)
+                    return True
+            await wait_for_rate_limit()
             ok = await save_entry_html(session, entry_url)
             if ok:
                 processed_ads.add(ad_id)
@@ -624,22 +750,110 @@ async def main():
     log_process_start("leaf_entries_scraping")
     
     import argparse
+    from run_paths import resolve_paths, write_run_meta
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--restart", action="store_true", help="Restart from zero, ignore checkpoint.")
+    parser.add_argument(
+        "--restart",
+        action="store_true",
+        help="Rewalk all search pages from page 1 and ignore leaf/page checkpoints.",
+    )
+    parser.add_argument(
+        "--url",
+        type=str,
+        help="Scrape a single Njuskalo search URL with filters already applied (skips category leaf files).",
+    )
+    parser.add_argument(
+        "--run",
+        type=str,
+        help="Store outputs under backend/runs/<name>/ so multiple filter fetches stay separate.",
+    )
+    parser.add_argument(
+        "--polite",
+        action="store_true",
+        help="Safer defaults for larger scrapes: concurrency=1, delay=2s, page-delay=1.5s.",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=None,
+        help="Max parallel ad page downloads (default: 6, or 1 with --polite).",
+    )
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=None,
+        help="Seconds to wait after each ad fetch (default: 0, or 2 with --polite).",
+    )
+    parser.add_argument(
+        "--page-delay",
+        type=float,
+        default=None,
+        help="Base seconds between search result pages (default: 0.5-1.0, or 1.5 with --polite).",
+    )
+    parser.add_argument(
+        "--local-only",
+        action="store_true",
+        help="Never switch to proxies; always use your local connection.",
+    )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip ads that already have HTML saved (resume without refetching).",
+    )
     args = parser.parse_args()
 
+    paths = resolve_paths(args.run)
+    apply_run_paths(paths)
+    apply_rate_limits(
+        concurrency=args.concurrency,
+        delay=args.delay,
+        page_delay=args.page_delay,
+        polite=args.polite,
+    )
+    apply_connection_options(local_only=args.local_only, skip_existing=args.skip_existing)
+    if args.run:
+        write_run_meta(
+            paths,
+            url=args.url,
+            extra={
+                "rate_limit": {
+                    "concurrency": CONCURRENT_ENTRIES,
+                    "entry_delay": ENTRY_DELAY,
+                    "page_delay_min": PAGE_DELAY_MIN,
+                    "page_delay_max": PAGE_DELAY_MAX,
+                    "polite": args.polite,
+                },
+                "local_only": args.local_only,
+                "skip_existing": args.skip_existing,
+            },
+        )
+        print(f"[INFO] Run '{paths['run_name']}' -> {paths['root']}")
+
     # Use global today_str (do not reassign locally)
-    # Find all .txt files in LEAF_URLS_DIR
-    leaf_files = [os.path.join(LEAF_URLS_DIR, f) for f in os.listdir(LEAF_URLS_DIR) if f.endswith(f'_{today_str}.txt')]
-    if not leaf_files:
-        print(f"No .txt files found in {LEAF_URLS_DIR}")
-        return
+    if args.url:
+        leaf_files = [write_custom_url_file(args.url)]
+    else:
+        # Find all .txt files in LEAF_URLS_DIR
+        leaf_files = [os.path.join(LEAF_URLS_DIR, f) for f in os.listdir(LEAF_URLS_DIR) if f.endswith(f'_{today_str}.txt')]
+        if not leaf_files:
+            print(f"No .txt files found in {LEAF_URLS_DIR}")
+            return
 
     # Check checkpoint files for today's date in filename
     checkpoint_files_today = [os.path.join(CHECKPOINTS_DIR, f) for f in os.listdir(CHECKPOINTS_DIR)
-                             if f.startswith(f"scrape_checkpoint_{today_str}_") and f.endswith(".json")]
+                             if (
+                                 f.startswith(f"scrape_checkpoint_{today_str}_")
+                                 or f.startswith(f"scrape_pages_{today_str}_")
+                             ) and f.endswith(".json")]
     checkpoint_files_old = [os.path.join(CHECKPOINTS_DIR, f) for f in os.listdir(CHECKPOINTS_DIR)
-                           if f.startswith("scrape_checkpoint_") and not f.startswith(f"scrape_checkpoint_{today_str}_") and f.endswith(".json")]
+                           if (
+                               f.startswith("scrape_checkpoint_")
+                               or f.startswith("scrape_pages_")
+                           ) and not (
+                               f.startswith(f"scrape_checkpoint_{today_str}_")
+                               or f.startswith(f"scrape_pages_{today_str}_")
+                           ) and f.endswith(".json")]
     if not checkpoint_files_today and checkpoint_files_old:
         print("No checkpoint files from today. Deleting all old checkpoints and starting fresh.")
         for cp in checkpoint_files_old:
@@ -648,6 +862,9 @@ async def main():
             except Exception as e:
                 print(f"Could not delete {cp}: {e}")
 
+    if args.restart:
+        clear_page_checkpoints()
+
     for leaf_file in leaf_files:
         print(f"\nProcessing leaf URL file: {leaf_file}")
         with open(leaf_file, "r", encoding="utf-8") as f:
@@ -655,7 +872,12 @@ async def main():
         if not leaf_urls:
             print(f"  [SKIP] No URLs in {leaf_file}")
             continue
-        start_idx = 0 if args.restart else load_checkpoint(leaf_file)
+        if args.restart:
+            clear_page_checkpoints(leaf_file)
+            start_idx = 0
+            print("  Rewalking all search pages from page 1")
+        else:
+            start_idx = load_checkpoint(leaf_file)
         total_leaves = len(leaf_urls)
         print(f"  Starting from leaf {start_idx+1} of {total_leaves}")
 

@@ -11,11 +11,19 @@ This pipeline runs the complete Njuskalo scraping process in the correct order:
 4. parser_ultrafast.py - Parse HTML to structured JSON
 
 Usage:
-    python pipeline.py [--step STEP] [--skip-existing]
+    python pipeline.py [--step STEP] [--skip-existing] [--url URL] [--run NAME] [--polite]
 
 Options:
-    --step STEP         Run specific step only (1-4)
-    --skip-existing     Skip steps if output already exists
+    --step STEP              Run specific step only (1-4)
+    --skip-existing          Skip pipeline steps if their output already exists
+    --url URL                Scrape a single filtered Njuskalo search URL (skips step 1)
+    --run NAME               Isolate outputs under backend/runs/<NAME>/
+    --polite                 Safer pacing for large scrapes (1 concurrent, ~2s delay)
+    --local-only             Never use proxies during scrape
+    --skip-existing-html     Skip ads that already have HTML (resume without refetch)
+    --concurrency N          Max parallel ad downloads
+    --delay SECONDS          Delay between ad request starts
+    --page-delay SECONDS     Delay between search result pages
 """
 
 import os
@@ -25,6 +33,8 @@ import subprocess
 import argparse
 from datetime import datetime
 import logging
+
+from run_paths import resolve_paths
 
 # Setup logging
 logging.basicConfig(
@@ -37,25 +47,64 @@ logging.basicConfig(
 )
 
 class PipelineRunner:
-    def __init__(self, skip_existing=False):
+    def __init__(
+        self,
+        skip_existing=False,
+        custom_url=None,
+        run_name=None,
+        polite=False,
+        concurrency=None,
+        delay=None,
+        page_delay=None,
+        local_only=False,
+        skip_existing_html=False,
+    ):
         self.skip_existing = skip_existing
+        self.custom_url = custom_url
+        self.run_name = run_name
+        self.polite = polite
+        self.concurrency = concurrency
+        self.delay = delay
+        self.page_delay = page_delay
+        self.local_only = local_only
+        self.skip_existing_html = skip_existing_html
+        self.paths = resolve_paths(run_name)
         self.start_time = time.time()
         self.step_times = {}
+
+    def run_extra_args(self, *args):
+        extra = list(args)
+        if self.run_name:
+            extra.extend(['--run', self.run_name])
+        if self.polite:
+            extra.append('--polite')
+        if self.concurrency is not None:
+            extra.extend(['--concurrency', str(self.concurrency)])
+        if self.delay is not None:
+            extra.extend(['--delay', str(self.delay)])
+        if self.page_delay is not None:
+            extra.extend(['--page-delay', str(self.page_delay)])
+        if self.local_only:
+            extra.append('--local-only')
+        if self.skip_existing_html:
+            extra.append('--skip-existing')
+        return extra or None
         
-    def run_script(self, script_name, step_num, description):
+    def run_script(self, script_name, step_num, description, extra_args=None):
         """Run a Python script and track execution time"""
+        cmd = [sys.executable, script_name] + (extra_args or [])
         logging.info(f"=" * 60)
         logging.info(f"STEP {step_num}: {description}")
-        logging.info(f"Running: {script_name}")
+        logging.info(f"Running: {' '.join(cmd)}")
         logging.info(f"=" * 60)
         
         step_start = time.time()
         
         try:
             # Run the script
-            result = subprocess.run([
-                sys.executable, script_name
-            ], capture_output=True, text=True, encoding='utf-8')
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, encoding='utf-8'
+            )
             
             step_duration = time.time() - step_start
             self.step_times[f"Step {step_num}"] = step_duration
@@ -90,6 +139,10 @@ class PipelineRunner:
     
     def step1_category_scraper(self):
         """Step 1: Scrape category tree and URLs"""
+        if self.custom_url:
+            logging.info("⏭️  STEP 1 SKIPPED: Using custom filtered URL")
+            return True
+
         if self.skip_existing:
             # Check if category URLs already exist
             if self.check_output_exists(['category_urls.json', 'categories.json']):
@@ -105,49 +158,57 @@ class PipelineRunner:
     def step2_scrape_entries(self):
         """Step 2: Scrape individual ad HTML pages"""
         if self.skip_existing:
-            # Check if HTML files already exist
-            if self.check_output_exists(['backend/website']):
+            if self.check_output_exists([self.paths['website']]):
                 logging.info("⏭️  STEP 2 SKIPPED: HTML files already exist")
                 return True
         
+        extra = []
+        if self.custom_url:
+            extra.extend(['--url', self.custom_url])
         return self.run_script(
             'scrape_leaf_entries.py',
             2,
-            'Scraping individual ad HTML pages'
+            'Scraping individual ad HTML pages',
+            extra_args=self.run_extra_args(*extra),
         )
     
     def step3_fetch_phones(self):
         """Step 3: Fetch phone numbers via API"""
         if self.skip_existing:
-            # Check if phone database already exists
-            if self.check_output_exists(['backend/phoneDB/phones.db']):
+            if self.check_output_exists([self.paths['phone_db']]):
                 logging.info("⏭️  STEP 3 SKIPPED: Phone database already exists")
                 return True
         
+        # Phone fetcher only needs --run (rate flags are scrape-only)
+        extra = ['--run', self.run_name] if self.run_name else None
         return self.run_script(
             'fetch_phones_from_api.py',
             3,
-            'Fetching phone numbers via API'
+            'Fetching phone numbers via API',
+            extra_args=extra,
         )
     
     def step4_parse_ultrafast(self):
         """Step 4: Parse HTML to structured JSON"""
         if self.skip_existing:
-            # Check if JSON files already exist
-            if self.check_output_exists(['backend/json']):
+            if self.check_output_exists([self.paths['json']]):
                 logging.info("⏭️  STEP 4 SKIPPED: JSON files already exist")
                 return True
         
+        extra = ['--run', self.run_name] if self.run_name else None
         return self.run_script(
             'parser_ultrafast.py',
             4,
-            'Parsing HTML to structured JSON (ultrafast)'
+            'Parsing HTML to structured JSON (ultrafast)',
+            extra_args=extra,
         )
     
     def run_full_pipeline(self):
         """Run the complete pipeline"""
         logging.info("🚀 STARTING NJUSKALO SCRAPING PIPELINE")
         logging.info(f"Started at: {datetime.now().isoformat()}")
+        if self.run_name:
+            logging.info(f"Run folder: {self.paths['root']}")
         
         steps = [
             (self.step1_category_scraper, "Category Tree Scraper"),
@@ -210,6 +271,8 @@ class PipelineRunner:
         
         step_func, step_name = steps[step_num]
         logging.info(f"🎯 RUNNING SINGLE STEP {step_num}: {step_name}")
+        if self.run_name:
+            logging.info(f"Run folder: {self.paths['root']}")
         
         success = step_func()
         total_time = time.time() - self.start_time
@@ -240,11 +303,67 @@ def main():
         action='store_true',
         help='Skip steps if output already exists'
     )
+
+    parser.add_argument(
+        '--url',
+        type=str,
+        help='Scrape a single Njuskalo search URL with filters already applied (skips category tree scrape)'
+    )
+
+    parser.add_argument(
+        '--run',
+        type=str,
+        help='Isolate outputs under backend/runs/<name>/ for separate filter fetches'
+    )
+
+    parser.add_argument(
+        '--polite',
+        action='store_true',
+        help='Safer scrape pacing for large runs (~300 ads): 1 concurrent, ~2s delay'
+    )
+    parser.add_argument(
+        '--concurrency',
+        type=int,
+        default=None,
+        help='Max parallel ad downloads (scrape step only)'
+    )
+    parser.add_argument(
+        '--delay',
+        type=float,
+        default=None,
+        help='Seconds between ad request starts (scrape step only)'
+    )
+    parser.add_argument(
+        '--page-delay',
+        type=float,
+        default=None,
+        help='Seconds between search result pages (scrape step only)'
+    )
+    parser.add_argument(
+        '--local-only',
+        action='store_true',
+        help='Never use proxies during scrape (local IP only)'
+    )
+    parser.add_argument(
+        '--skip-existing-html',
+        action='store_true',
+        help='Skip ads that already have HTML saved (resume without refetching)'
+    )
     
     args = parser.parse_args()
     
     # Create pipeline runner
-    runner = PipelineRunner(skip_existing=args.skip_existing)
+    runner = PipelineRunner(
+        skip_existing=args.skip_existing,
+        custom_url=args.url,
+        run_name=args.run,
+        polite=args.polite,
+        concurrency=args.concurrency,
+        delay=args.delay,
+        page_delay=args.page_delay,
+        local_only=args.local_only,
+        skip_existing_html=args.skip_existing_html,
+    )
     
     try:
         if args.step:

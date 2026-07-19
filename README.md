@@ -1,170 +1,261 @@
-# 🏠 Njuskalo Scraping Pipeline
+# Njuskalo scraper
 
-A complete automated pipeline for scraping and parsing real estate data from **[Njuskalo.hr](https://www.njuskalo.hr/)**.  
-This project is designed for **data collection, research, and analysis** purposes, with full support for resuming, skipping, and modular execution of each pipeline step.
+Scrapes real-estate listings from [Njuskalo.hr](https://www.njuskalo.hr/) into HTML, then parses them to JSON.
+
+For **research / personal data collection** only. Check Njuskalo’s Terms of Service before running anything.
 
 ---
 
-## 📦 Requirements
+## Two ways to use this repo
 
-- **Python**: 3.8+  
-- **OS**: Linux, macOS, Windows  
-- **Dependencies**: listed in `requirements.txt`  
+| Mode | When to use | What it does |
+|------|-------------|--------------|
+| **A. Filtered URL** (recommended) | You already set filters in the browser (area, price, floor, garden, …) | Scrapes **only that search** |
+| **B. Full pipeline** | You want a broad scrape of many categories | Walks the site category tree, then scrapes everything it finds |
 
-### Install
+Most people want **Mode A**.
+
+---
+
+## Setup (once)
+
+Needs **Python 3.8+**.
+
 ```bash
+cd njuskalo-scraper
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 playwright install
 ```
 
----
-
-## 🚀 Quick Start
-
-### Run Complete Pipeline
-```bash
-python pipeline.py
-```
-
-### Run Specific Steps
-```bash
-python pipeline.py --step 1  # Category scraper only
-python pipeline.py --step 2  # HTML scraper only  
-python pipeline.py --step 3  # Phone fetcher only
-python pipeline.py --step 4  # Parser only
-```
-
-### Skip Existing Data
-```bash
-python pipeline.py --skip-existing
-```
-
-### Windows Shortcut
-```bash
-run_pipeline.bat
-```
-*(Windows-only helper script; not required on Linux/macOS)*
+Optional: put proxies in `proxies.txt` (format `ip:port:user:pass`). For small/medium runs, prefer **`--local-only`** and skip proxies.
 
 ---
 
-## 📋 Pipeline Steps
+## Mode A — scrape a filtered browser URL (recommended)
 
-### Step 1: Category Tree Scraper
-- **Script**: `njuskalo_category_tree_scraper.py`
-- **Purpose**: Scrape category tree and collect all property listing URLs
-- **Output**: Category data and URL lists
+### 1. Copy your search URL
 
-### Step 2: HTML Page Scraper  
-- **Script**: `scrape_leaf_entries.py`
-- **Purpose**: Download individual property listing HTML pages  
-- **Output**: `backend/website/` directory with HTML files  
-- **Features**: checkpointing, proxy rotation, session management, retry logic
+In the browser, apply filters on Njuskalo, then copy the address bar URL.  
+Example shape:
 
-### Step 3: Phone Number Fetcher
-- **Script**: `fetch_phones_from_api.py`  
-- **Purpose**: Extract phone numbers via Njuskalo API  
-- **Output**: `backend/phoneDB/phones.db` SQLite database  
-- **Features**: async processing (50 req/sec), token auto-refresh, skip processed ads
+`https://www.njuskalo.hr/prodaja-stanova/zagreb?livingArea[min]=60&...`
 
-### Step 4: Ultrafast Parser
-- **Script**: `parser_ultrafast.py`  
-- **Purpose**: Parse HTML files to structured JSON data  
-- **Output**: `backend/json/` directory with parsed data  
-- **Features**: memory-cached lookups, multi-core parsing, 3–5× faster than standard parser  
+### 2. Scrape listing pages
+
+Pick a **run name** so this search’s files don’t mix with others:
+
+```bash
+source .venv/bin/activate
+
+python scrape_leaf_entries.py \
+  --run my-search \
+  --url 'PASTE_YOUR_URL_HERE' \
+  --polite \
+  --local-only
+```
+
+- `--run my-search` → data goes to `backend/runs/my-search/`
+- `--polite` → slow & safer (1 request at a time, ~2s gap)
+- `--local-only` → never use proxies (avoids broken proxy lists)
+
+Quote the URL so `&` in filters isn’t eaten by the shell.
+
+### 3. Parse HTML → JSON
+
+```bash
+python parser_ultrafast.py --run my-search
+```
+
+JSON lands in `backend/runs/my-search/json/`.
+
+### Optional: phones
+
+```bash
+python fetch_phones_from_api.py --run my-search
+```
+
+Only if you need phone numbers. This hits Njuskalo’s API harder — skip it unless you need it.
+
+### Same thing via the pipeline helper
+
+```bash
+python pipeline.py \
+  --run my-search \
+  --url 'PASTE_YOUR_URL_HERE' \
+  --polite \
+  --local-only
+```
+
+That runs scrape → phones → parse. To scrape + parse **without** phones, call the two scripts above instead.
 
 ---
 
-## 📊 Output Structure
+## Where files go
+
+### With `--run my-search` (Mode A)
+
+```
+backend/runs/my-search/
+  website/     # one .html per listing
+  json/        # one .json per listing (after parse)
+  phoneDB/     # phones.db (only if you fetch phones)
+  meta.json    # remembers your URL / options
+  logs/
+```
+
+Use a **new `--run` name** for each different filter set (`zagreb-ground-garden`, `podsused-80-170`, …).
+
+### Without `--run` (Mode B / legacy)
+
+Everything shares one folder and **will mix**:
 
 ```
 backend/
-├── website/           # HTML files from Step 2
-├── phoneDB/           # Phone database from Step 3
-│   ├── phones.db      # SQLite database
-│   └── phones.log     # Phone fetcher logs
-├── json/              # Parsed JSON from Step 4
-└── logs/              # Parser logs
+  website/
+  json/
+  phoneDB/
+  logs/
 ```
 
-### Example JSON Output
+---
+
+## Resume / re-scrape (Mode A)
+
+Interrupted run? Missing some ads after proxy errors?
+
+```bash
+# Rewalk all search result pages, but don't re-download HTML you already have
+python scrape_leaf_entries.py \
+  --run my-search \
+  --url 'PASTE_YOUR_URL_HERE' \
+  --polite \
+  --local-only \
+  --skip-existing \
+  --restart
+```
+
+| Flag | Meaning |
+|------|---------|
+| `--skip-existing` | Skip ads that already have an HTML file |
+| `--restart` | Start search pages from page 1 again (don’t resume mid-pagination) |
+| `--local-only` | Stay on your IP; don’t rotate to proxies |
+| `--polite` | Slow pacing |
+
+Safer / slower (e.g. ~300 listings):
+
+```bash
+python scrape_leaf_entries.py \
+  --run my-search \
+  --url 'PASTE_YOUR_URL_HERE' \
+  --local-only \
+  --concurrency 1 \
+  --delay 4 \
+  --page-delay 3
+```
+
+---
+
+## Mode B — full category pipeline
+
+Scrapes the hardcoded category list in `njuskalo_category_tree_scraper.py` (houses, flats, land, rentals, …), then HTML → phones → JSON.
+
+```bash
+source .venv/bin/activate
+python pipeline.py
+```
+
+Or one step at a time:
+
+```bash
+python pipeline.py --step 1   # category tree + leaf URLs
+python pipeline.py --step 2   # download listing HTML
+python pipeline.py --step 3   # phones
+python pipeline.py --step 4   # parse to JSON
+```
+
+| Step | Script | Output (no `--run`) |
+|------|--------|---------------------|
+| 1 | `njuskalo_category_tree_scraper.py` | category / leaf URL files under `backend/categories/` |
+| 2 | `scrape_leaf_entries.py` | `backend/website/*.html` |
+| 3 | `fetch_phones_from_api.py` | `backend/phoneDB/phones.db` |
+| 4 | `parser_ultrafast.py` | `backend/json/*.json` |
+
+`python pipeline.py --skip-existing` means: **skip a whole step** if its output folder already has data.  
+That is **not** the same as scraper’s `--skip-existing` (skip individual HTML files).
+
+---
+
+## Flag cheat sheet
+
+### Scraper (`scrape_leaf_entries.py`)
+
+| Flag | What it does |
+|------|----------------|
+| `--url URL` | One filtered Njuskalo search URL |
+| `--run NAME` | Write under `backend/runs/NAME/` |
+| `--polite` | concurrency=1, ~2s delay |
+| `--local-only` | Never use proxies |
+| `--skip-existing` | Don’t refetch ads that already have HTML |
+| `--restart` | Rewalk search pages from page 1 |
+| `--concurrency N` | Parallel ad downloads |
+| `--delay SEC` | Gap between ad requests |
+| `--page-delay SEC` | Gap between search result pages |
+
+### Pipeline (`pipeline.py`)
+
+Same idea, plus:
+
+| Flag | What it does |
+|------|----------------|
+| `--url` / `--run` / `--polite` / `--local-only` | Passed through to the scraper |
+| `--skip-existing-html` | Passed through as scraper’s `--skip-existing` |
+| `--skip-existing` | Skip entire pipeline **steps** if outputs exist |
+| `--step 1-4` | Run only that step |
+
+---
+
+## Example JSON
+
 ```json
 {
-  "id": "123456",
-  "title": "2-Bedroom Apartment in Zagreb",
-  "price": "150000 EUR",
-  "location": "Zagreb - Maksimir",
-  "phone": "+385991234567",
-  "url": "https://www.njuskalo.hr/nekretnine/ad-id-123456"
+  "id": "47372432",
+  "link": "https://www.njuskalo.hr/nekretnine/...",
+  "naslov": "Stan: Zagreb (Podsused), 70.00 m2 ...",
+  "cijena": "362.352 €",
+  "Lokacija": "Grad Zagreb, Podsused - Vrapče, Podsused",
+  "telefon": null
 }
 ```
 
----
-
-## 🔧 Configuration
-
-### Phone Fetcher
-- `RESCRAPE_NULL_PHONES = False` – re-scrape ads with no phone numbers if set to `True`
-- `BATCH_SIZE = 50` – number of concurrent API requests  
-
-### Parser
-- `BATCH_SIZE = 200` – files per processing batch  
-- `MAX_WORKERS = cpu_count()` – use all CPU cores  
+(`telefon` stays `null` unless you ran the phone step.)
 
 ---
 
-## 📝 Logging
+## Troubleshooting
 
-- **Pipeline log**: `pipeline.log` – overall pipeline execution  
-- **Phone log**: `backend/phoneDB/phones.log` – phone fetching details  
-- **Parser logs**: `backend/logs/` – individual parsing logs  
+**Proxies failing with `407` / `CONNECT tunnel failed`**  
+Your `proxies.txt` entries are bad or need auth. Use `--local-only`.
 
----
+**Scrape stopped mid-way; re-run only fetched the last page**  
+Use `--restart --skip-existing` so it rewalks all pages but keeps existing HTML.
 
-## ⚡ Performance
-
-Expected throughput (based on typical tests):  
-- **Phone Fetcher**: ~50 requests/second  
-- **Parser**: 3–5× faster than standard parser  
-- **Complete Pipeline**: performance depends on dataset size + network speed  
-
----
-
-## 🛠️ Troubleshooting
-
-### Resume from Failure
-The pipeline supports resuming from any step. Each step checks for existing output and can skip completed work.
-
-### Individual Step Execution
+**`ModuleNotFoundError: psutil`**  
 ```bash
-python pipeline.py --step 3  # Re-run phone fetcher only
+pip install -r requirements.txt
 ```
 
-### Skip Existing Data
-```bash
-python pipeline.py --skip-existing
-```
+**ShieldSquare / captcha / empty pages**  
+You’re rate-limited or blocked. Stop, wait, then retry slower (`--delay 4` or higher).
+
+**Data from two searches got mixed**  
+You forgot `--run`. Next time use different run names.
 
 ---
 
-## 📁 Required Files
+## Notes
 
-Ensure these scripts exist in your project directory:
-- `njuskalo_category_tree_scraper.py`
-- `scrape_leaf_entries.py` 
-- `fetch_phones_from_api.py`
-- `parser_ultrafast.py`
-- `bearer_token_finder.py` (required by phone fetcher)
-
----
-
-## 🚨 Notes & Disclaimer
-
-- The `backend/` folder is excluded from Git (see `.gitignore`)  
-- Phone fetching requires valid bearer tokens (handled automatically)  
-- Parser uses memory caching for maximum speed  
-- All steps include comprehensive error handling and logging  
-
-⚠️ **Disclaimer**:  
-This project is provided **for educational and research purposes only**.  
-Before running scrapers against Njuskalo.hr, please review and comply with their **Terms of Service**. The author(s) are not responsible for misuse.  
-
+- `backend/` is gitignored — scraped data stays on your machine.
+- Windows helper: `run_pipeline.bat` (Mode B style; not required on macOS/Linux).
+- Phone step needs a browser token via Playwright (`bearer_token_finder.py`); handled automatically when you run it.

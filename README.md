@@ -70,7 +70,46 @@ python parser_ultrafast.py --run my-search
 
 JSON lands in `backend/runs/my-search/json/`.
 
-### Optional: phones
+### Analyze €/m²
+
+```bash
+python analyze_price_m2.py --run my-search
+python analyze_price_m2.py --run my-search --csv /tmp/my-search-eur-m2.csv
+python analyze_price_m2.py --run my-search --plots
+```
+
+Prints median / percentiles and cheapest/dearest listings. By default skips prices under **20 000 €** (placeholders like `1 €`, and ads that put €/m² in the price field).
+
+`--plots` writes charts under `backend/runs/<run>/analysis/`:
+
+| File | What it shows |
+|------|----------------|
+| `eur_m2_hist.png` | €/m² distribution + median |
+| `price_vs_area.png` | Asking price vs living area |
+| `eur_m2_outliers.png` | €/m² vs area with p5/p95 outliers labeled |
+| `eur_m2_cdf.png` | Cumulative % of listings ≤ €/m² |
+| `eur_m2_by_rooms.png` | Median €/m² by room count |
+| `eur_m2_by_neighborhood.png` | Median €/m² by neighborhood |
+| `eur_m2_by_floor.png` | Boxplot by floor (`Kat`) |
+| `eur_m2_heatmap_rooms_floor.png` | Rooms × floor median heatmap |
+| `eur_m2_by_features.png` | Median with/without key features |
+| `eur_m2_by_agency.png` | Top agencies: count + median €/m² |
+| `eur_m2_vs_age.png` | €/m² vs days since published |
+| `eur_m2_map.png` | Lat/lng scatter colored by €/m² |
+| `eur_m2_map.html` | Interactive Leaflet map (open in a browser) |
+
+### Compare runs (HTML dashboard)
+
+```bash
+python analyze_price_m2.py \
+  --run podsused-vrapce \
+  --compare prizemlje-vrt \
+  --dashboard
+```
+
+Writes `backend/analysis/dashboard.html` — open in a browser for side-by-side stats, distribution, neighborhoods, features, and cheapest/dearest tables. Links to each run’s map when `analysis/eur_m2_map.html` exists.
+
+You can pass several compares: `--compare a --compare b` or `--compare a,b`.
 
 ```bash
 python fetch_phones_from_api.py --run my-search

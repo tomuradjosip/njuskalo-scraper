@@ -10,3 +10,4 @@ tqdm
 playwright 
 playwright-stealth
 psutil
+matplotlib
